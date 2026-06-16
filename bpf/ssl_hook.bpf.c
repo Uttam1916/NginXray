@@ -1,84 +1,88 @@
-#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
-#include <bpf/bpf_core_read.h>
-
+#include <linux/bpf.h>
 #define MAX_BUF_SIZE 8192
+#define TASK_COMM_LEN 16
 
-// each buf read and obtained
-struct ssl_buf {
-    __u32 tid;
-    __u32 len;
-    __u8 buf[MAX_BUF_SIZE];
+struct probe_SSL_data_t {
+    __u64 timestamp_ns;       // Timestamp (nanoseconds)
+    __u64 delta_ns;           // Function execution time
+    __u32 pid;                // Process ID
+    __u32 tid;                // Thread ID
+    __u32 uid;                // User ID
+    __u32 len;                // Length of read/write data
+    int buf_filled;           // Whether buffer is filled completely
+    int rw;                   // Read or Write (0 for read, 1 for write)
+    char comm[TASK_COMM_LEN]; // Process name
+    __u8 buf[MAX_BUF_SIZE];   // Data buffer
+    int is_handshake;         // Whether it's handshake data
 };
 
-// to contain pointers to ssl bufs
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key, __u32);
-    __type(value, __u64);
-} bufs SEC(".maps");
+static int SSL_exit(struct pt_regs *ctx, int rw) {
+    int ret = 0;
+    u32 zero = 0;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
+    u32 uid = bpf_get_current_uid_gid();
+    u64 ts = bpf_ktime_get_ns();
 
-// ring buf to contain actual text
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 8192 * 128);
-} ringbuf SEC(".maps");
-
-SEC("uprobe/SSL_read")
-int BPF_UPROBE(ssl_read_entry, void *ssl, void *buf, int num) {
-    // obtain process id and thread group id
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-
-    // tid = the id of the thread which is pid but naming it as tid
-    __u32 tid = (__u32)pid_tgid;
-
-    // convert into useable pointer
-    __u64 bufp = (__u64)buf;
-
-    bpf_map_update_elem(&bufs, &tid, &bufp, BPF_ANY);
-    return 0;
-}
-
-SEC("uretprobe/SSL_read")
-int BPF_URETPROBE(ssl_read_exit) {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tid = (__u32)pid_tgid;
-
-    // obtain associated buf pointer
-    __u64 *bufp = bpf_map_lookup_elem(&bufs, &tid);
-    if (!bufp)
+    if (!trace_allowed(uid, pid)) {
         return 0;
+    }
+
+    /* store arg info for later lookup */
+    u64 *bufp = bpf_map_lookup_elem(&bufs, &tid);
+    if (bufp == 0)
+        return 0;
+
+    u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
+    if (!tsp)
+        return 0;
+    u64 delta_ns = ts - *tsp;
 
     int len = PT_REGS_RC(ctx);
-    if (len <= 0) {
-        bpf_map_delete_elem(&bufs, &tid);
+    if (len <= 0) // no data
         return 0;
-    }
 
-    // prevent copying beyond buffer size
-    if (len > MAX_BUF_SIZE)
-        len = MAX_BUF_SIZE;
-
-    // use ssl_data struct to reserve space and submit onto ringbuf
-    struct ssl_buf *e =
-        bpf_ringbuf_reserve(&ringbuf, sizeof(struct ssl_buf), 0);
-
-    if (!e) {
-        bpf_map_delete_elem(&bufs, &tid);
+    struct probe_SSL_data_t *data = bpf_map_lookup_elem(&ssl_data, &zero);
+    if (!data)
         return 0;
-    }
 
-    e->tid = tid;
-    e->len = len;
+    data->timestamp_ns = ts;
+    data->delta_ns = delta_ns;
+    data->pid = pid;
+    data->tid = tid;
+    data->uid = uid;
+    data->len = (u32)len;
+    data->buf_filled = 0;
+    data->rw = rw;
+    data->is_handshake = false;
+    u32 buf_copy_size = min((size_t)MAX_BUF_SIZE, (size_t)len);
 
-    bpf_probe_read_user(e->buf, len, (void *)*bufp);
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
 
-    bpf_ringbuf_submit(e, 0);
+    if (bufp != 0)
+        ret = bpf_probe_read_user(&data->buf, buf_copy_size, (char *)*bufp);
+
     bpf_map_delete_elem(&bufs, &tid);
+    bpf_map_delete_elem(&start_ns, &tid);
 
+    if (!ret)
+        data->buf_filled = 1;
+    else
+        buf_copy_size = 0;
+
+    bpf_perf_event_output(ctx, &perf_SSL_events, BPF_F_CURRENT_CPU, data,
+                          EVENT_SIZE(buf_copy_size));
     return 0;
 }
+SEC("uretprobe/SSL_read")
+int BPF_URETPROBE(probe_SSL_read_exit) {
+    return (SSL_exit(ctx, 0)); // 0 indicates read operation
+}
 
-char LICENSE[] SEC("license") = "GPL";
+SEC("uretprobe/SSL_write")
+int BPF_URETPROBE(probe_SSL_write_exit) {
+    return (SSL_exit(ctx, 1)); // 1 indicates write operation
+}
