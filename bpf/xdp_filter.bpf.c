@@ -55,11 +55,11 @@ int filter(struct xdp_md *ctx) {
     return XDP_PASS;
 
   // traceprint ip
-  bpf_printk("src=%x", ip->saddr);
+  bpf_printk("src=%x", bpf_ntohl(ip->saddr));
   struct lpm_key key = {};
 
   key.prefixlen = 32;
-  key.ip = ip->saddr;
+  key.ip = bpf_ntohl(ip->saddr);
 
   struct block_info *blocked;
 
