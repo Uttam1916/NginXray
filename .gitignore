@@ -21,4 +21,4 @@ coverage.*
 *.swp
 
 clang-format
-
+bpf/vmlinux.h
