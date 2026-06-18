@@ -84,6 +84,6 @@ func main() {
 			continue
 		}
 
-		log.Printf("TID:%d LEN:%d \n %s \n", buf.Tid, buf.Len, buf.Buf)
+		log.Printf("TID:%d LEN:%d \n %s \n", buf.Tid, buf.Len, string(buf.Buf[:buf.Len]))
 	}
 }
